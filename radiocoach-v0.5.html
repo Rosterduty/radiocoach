@@ -428,8 +428,10 @@ const App = {
   whisperPipeline: null, whisperLoading: false,
   settings: {
     callsign: 'TURKISH 1',
-    sttEngine: 'webspeech',
+    sttEngine: 'openai-whisper',
     whisperModel: 'Xenova/whisper-base.en',
+    openaiKey: '',
+    aiEval: true,
     autoStart: true,
   },
 };
@@ -780,6 +782,88 @@ async function loadWhisper() {
     throw e;
   } finally { App.whisperLoading = false; }
 }
+// ===== OpenAI Whisper API =====
+async function transcribeWhisperOpenAI(blob) {
+  const key = App.settings.openaiKey;
+  if (!key) throw new Error('OpenAI API key not configured');
+  if (!blob || blob.size === 0) throw new Error('No audio captured');
+  const fd = new FormData();
+  const ext = blob.type.includes('webm') ? 'webm' : blob.type.includes('mp4') ? 'm4a' : blob.type.includes('ogg') ? 'ogg' : 'webm';
+  fd.append('file', blob, `audio.${ext}`);
+  fd.append('model', 'whisper-1');
+  fd.append('language', 'en');
+  fd.append('response_format', 'json');
+  fd.append('temperature', '0');
+  fd.append('prompt',
+    'Aviation radio communication. ICAO phonetics: niner, tree, fife, fower. ' +
+    'Frequencies as "one two seven decimal niner zero". ' +
+    'Callsigns: Turkish, Pegasus, Emirates, Lufthansa, KLM, Speedbird, United. ' +
+    'Phraseology: cleared, contact, maintain, descend, climb, expect, approach, departure, ' +
+    'taxi, hold short, line up, runway, squawk, mayday, pan pan, wilco, roger, affirm, negative, ' +
+    'pushback approved, face south, face north, start up at your discretion, gate alpha, gate bravo.'
+  );
+  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${key}` },
+    body: fd,
+  });
+  if (!res.ok) {
+    let m = `${res.status}`;
+    try { const d = await res.json(); m += ' · ' + (d.error?.message || JSON.stringify(d)); }
+    catch (e) { m += ' · ' + (await res.text()); }
+    throw new Error(m);
+  }
+  const data = await res.json();
+  return (data.text || '').trim();
+}
+
+// ===== OpenAI semantic eval =====
+async function evaluateWithAI(transcript, scenario) {
+  const key = App.settings.openaiKey;
+  if (!key) throw new Error('OpenAI API key not configured');
+  const sys = `You are a Type Rating Instructor (TRI) and ICAO Doc 9432 expert evaluating pilot R/T readback. You score with semantic understanding, not exact word matching. A pilot saying "approved to push, facing south, starting at our own discretion" is equivalent to "pushback approved, face south, start up at our discretion" — both are correct. You penalise non-standard phraseology ("OK", "got it", "copy that"), missing critical elements, and incorrect order. You reward natural but compliant readback. Respond ONLY with valid JSON.`;
+  const usr = `Scenario: ${scenario.title}
+ATC said: "${scenario.atc}"
+Reference (ideal): "${scenario.reference}"
+Pilot said: "${transcript}"
+
+Required readback elements (with weights):
+${scenario.elements.map(e => `- ${e.label} (weight ${e.weight}, ${e.critical ? 'CRITICAL' : 'INFO'})`).join('\n')}
+
+Evaluate semantically. Return JSON:
+{
+  "completeness": <0-100, % of required elements present in pilot transcript by meaning, weighted>,
+  "phraseology": <0-100, ICAO compliance — penalise "OK", "got it", "copy that", "thank you", "please", "point" instead of "decimal" in frequencies>,
+  "conciseness": <0-100, appropriate length vs reference>,
+  "order": <0-100, elements in correct sequence>,
+  "elementResults": [{"id": "<element id>", "found": <true/false>, "reasoning": "<short why>"}],
+  "feedback": ["<short specific actionable feedback>", "<another>", ...]
+}
+
+Be strict on critical elements but generous on wording variations. Pilot does NOT need to match exact words — only meaning and compliance.`;
+
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'system', content: sys }, { role: 'user', content: usr }],
+      response_format: { type: 'json_object' },
+      temperature: 0.2,
+      max_tokens: 800,
+    }),
+  });
+  if (!res.ok) {
+    let m = `${res.status}`;
+    try { const d = await res.json(); m += ' · ' + (d.error?.message || JSON.stringify(d)); }
+    catch (e) {}
+    throw new Error(m);
+  }
+  const data = await res.json();
+  const text = data.choices?.[0]?.message?.content || '{}';
+  return JSON.parse(text);
+}
+
 async function transcribeWhisperLocal(blob) {
   const pipe = await loadWhisper();
   const buf = await blob.arrayBuffer();
@@ -1051,7 +1135,7 @@ function startTransmit() {
   playClick(1100, 0.06, 0.05);
   playStatic(0.10, 0.04);
   App.recordTimerId = setInterval(checkSilence, 200);
-  if (App.settings.sttEngine === 'local-whisper') {
+  if (App.settings.sttEngine === 'local-whisper' || App.settings.sttEngine === 'openai-whisper') {
     startMediaRecording();
   } else {
     if (webSpeechRec) try { webSpeechRec.stop(); } catch (e) {}
@@ -1078,7 +1162,7 @@ function checkSilence() {
   const lvl = lastNonZeroLevel();
   if (lvl > 0.05) lastVoiceTime = performance.now();
   if (lastVoiceTime > 0 && (performance.now() - lastVoiceTime) > SILENCE_MS) {
-    if (App.settings.sttEngine === 'local-whisper' || App.pilotTranscript.trim().length > 0) {
+    if (App.settings.sttEngine === 'local-whisper' || App.settings.sttEngine === 'openai-whisper' || App.pilotTranscript.trim().length > 0) {
       stopTransmit(true);
     }
   }
@@ -1094,18 +1178,20 @@ async function stopTransmit(autoTrigger=false) {
   setLiveStatus('processing', 'ANALYSING');
   vibrate([10, 50, 10]);
   playSquelch();
-  if (App.settings.sttEngine === 'local-whisper') {
+  if (App.settings.sttEngine === 'local-whisper' || App.settings.sttEngine === 'openai-whisper') {
     const blob = await stopMediaRecording();
     if (!blob || blob.size === 0) {
       showToast('No audio captured', 'bad');
     } else {
       try {
         $('ptt-label').textContent = 'Transcribing';
-        const transcript = await transcribeWhisperLocal(blob);
+        const transcript = App.settings.sttEngine === 'openai-whisper'
+          ? await transcribeWhisperOpenAI(blob)
+          : await transcribeWhisperLocal(blob);
         App.pilotTranscript = transcript.trim();
         $('pilot-transcript').textContent = App.pilotTranscript;
       } catch (e) {
-        showToast('Whisper: ' + e.message, 'bad');
+        showToast('STT error: ' + e.message, 'bad');
       }
     }
   } else {
@@ -1114,9 +1200,47 @@ async function stopTransmit(autoTrigger=false) {
   setTimeout(() => goToDebrief(), 400);
 }
 // ===== DEBRIEF =====
-function goToDebrief() {
+async function goToDebrief() {
   const scen = App.currentScenario;
-  const result = evaluate(App.pilotTranscript, scen);
+  let result;
+
+  // Try AI eval first if enabled and key exists
+  if (App.settings.aiEval && App.settings.openaiKey && App.pilotTranscript.trim().length > 0) {
+    try {
+      showToast('AI evaluating...', '', 1500);
+      const aiResult = await evaluateWithAI(App.pilotTranscript, scen);
+      // Map AI result back to our format
+      const elementResults = scen.elements.map(el => {
+        const aiEl = aiResult.elementResults?.find(e => e.id === el.id);
+        return { ...el, found: aiEl ? aiEl.found : false, aiReasoning: aiEl?.reasoning };
+      });
+      const overall = Math.round(
+        (aiResult.completeness || 0) * 0.50 +
+        (aiResult.phraseology || 0) * 0.20 +
+        (aiResult.conciseness || 0) * 0.15 +
+        (aiResult.order || 0) * 0.15
+      );
+      result = {
+        overall,
+        completeness: aiResult.completeness || 0,
+        phraseology: aiResult.phraseology || 0,
+        conciseness: aiResult.conciseness || 0,
+        order: aiResult.order || 0,
+        elementResults,
+        phraseologyMisses: [],
+        aiFeedback: aiResult.feedback || [],
+        txWords: App.pilotTranscript.trim().split(/\s+/).filter(Boolean).length,
+        refWords: scen.reference.trim().split(/\s+/).length,
+        usedAI: true,
+      };
+    } catch (e) {
+      showToast('AI eval failed: ' + e.message + ' · using local eval', 'bad', 3000);
+      result = evaluate(App.pilotTranscript, scen);
+    }
+  } else {
+    result = evaluate(App.pilotTranscript, scen);
+  }
+
   if (!App.history[scen.id]) App.history[scen.id] = [];
   App.history[scen.id].push({
     date: Date.now(), overall: result.overall,
@@ -1170,20 +1294,35 @@ function goToDebrief() {
 function buildCoachFeedback(scen, result) {
   const items = [];
   if (result.noTransmission) {
-    items.push({ type: 'bad', text: '<strong>No transmission detected.</strong> Speech-to-text captured 0 words. Check mic permission, then press and hold the mic button while speaking.' });
+    items.push({ type: 'bad', text: '<strong>No transmission detected.</strong> Press the mic button and speak clearly.' });
   }
-  result.elementResults.filter(e => !e.found && e.critical).forEach(el => {
-    items.push({ type: 'bad', text: `<strong>Missing:</strong> ${escapeHTML(el.label)}. This is a critical readback element.` });
-  });
-  result.phraseologyMisses.forEach(p => {
-    items.push({ type: 'bad', text: `<strong>Non-standard:</strong> ${escapeHTML(p.label)} should be avoided in R/T.` });
-  });
-  if (result.conciseness < 80 && !result.noTransmission) {
-    items.push({ type: 'tip', text: `<strong>Conciseness.</strong> ${result.txWords} words vs ${result.refWords} ideal. Trim filler.` });
+
+  // AI feedback first if available — most relevant
+  if (result.usedAI && result.aiFeedback && result.aiFeedback.length > 0) {
+    result.aiFeedback.forEach(f => {
+      items.push({ type: 'tip', text: f });
+    });
   }
-  if (result.order < 80 && !result.noTransmission) {
-    items.push({ type: 'tip', text: '<strong>Order.</strong> Read elements in clearance sequence: location/route → level → speed → freq → squawk → callsign.' });
+
+  // Element-based feedback only if AI didn't already say it
+  if (!result.usedAI) {
+    result.elementResults.filter(e => !e.found && e.critical).forEach(el => {
+      items.push({ type: 'bad', text: `<strong>Missing:</strong> ${escapeHTML(el.label)}. This is a critical readback element.` });
+    });
+    if (result.phraseologyMisses) {
+      result.phraseologyMisses.forEach(p => {
+        items.push({ type: 'bad', text: `<strong>Non-standard:</strong> ${escapeHTML(p.label)} should be avoided in R/T.` });
+      });
+    }
+    if (result.conciseness < 80 && !result.noTransmission) {
+      items.push({ type: 'tip', text: `<strong>Conciseness.</strong> ${result.txWords} words vs ${result.refWords} ideal. Trim filler.` });
+    }
+    if (result.order < 80 && !result.noTransmission) {
+      items.push({ type: 'tip', text: '<strong>Order.</strong> Read elements in clearance sequence.' });
+    }
   }
+
+  // Always show built-in scenario coaching
   scen.coaching.forEach(c => {
     items.push({ type: c.type === 'bad' ? 'bad' : c.type === 'good' ? 'good' : 'tip', text: c.text });
   });
@@ -1226,18 +1365,30 @@ function buildSettingsBody() {
     </div>
 
     <div class="settings-section">
+      <div class="label">OpenAI API Key</div>
+      <div class="settings-card">
+        <div class="settings-row col-block">
+          <div class="name">API Key (sk-proj-...)</div>
+          <input class="field" type="password" id="set-openai-key" value="${escapeHTML(App.settings.openaiKey || '')}" placeholder="sk-proj-...">
+          <div class="field-help">Get from platform.openai.com → API keys. ChatGPT Plus does NOT include API. Add $5 credit at platform.openai.com → Billing. Cost: ~$0.005 per scenario (Whisper + GPT eval).</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-section">
       <div class="label">Speech recognition</div>
       <div class="settings-card">
         <div class="settings-row col-block">
           <div class="name">Engine</div>
           <select class="field" id="set-engine">
+            <option value="openai-whisper">OpenAI Whisper · Aviation accurate · Needs API key</option>
+            <option value="local-whisper">Local Whisper · Free · Offline · 150 MB download</option>
             <option value="webspeech">Web Speech · Free · Limited aviation</option>
-            <option value="local-whisper">Local Whisper · Free · Offline · Aviation accurate</option>
           </select>
-          <div class="field-help">Web Speech is instant but struggles with "niner", callsigns. Local Whisper runs the AI in your browser — first use downloads ~150 MB.</div>
+          <div class="field-help">OpenAI Whisper recommended for testing — best aviation phrase accuracy. Requires API key above.</div>
         </div>
         <div class="settings-row col-block" id="whisper-config" style="display:none;">
-          <div class="name">Whisper model</div>
+          <div class="name">Local Whisper model</div>
           <select class="field" id="set-whisper-model">
             <option value="Xenova/whisper-tiny.en">whisper-tiny.en · ~75 MB · Fastest</option>
             <option value="Xenova/whisper-base.en">whisper-base.en · ~150 MB · Recommended</option>
@@ -1248,7 +1399,19 @@ function buildSettingsBody() {
             <div class="bar"><div class="bar-fill"></div></div>
           </div>
           <button class="btn-ghost" id="lw-download" style="margin-top:12px;">Download model</button>
-          <div class="field-help">Download once, cached forever in your browser.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="label">Evaluation</div>
+      <div class="settings-card">
+        <div class="settings-row">
+          <div class="col">
+            <div class="name">AI semantic eval (GPT-4o-mini)</div>
+            <div class="sub">Understands meaning, not just words · ~$0.003/scenario</div>
+          </div>
+          <div class="toggle ${App.settings.aiEval ? 'on' : ''}" id="tg-aieval"></div>
         </div>
       </div>
     </div>
@@ -1284,6 +1447,10 @@ function openSettings() {
     App.settings.callsign = e.target.value.toUpperCase();
     saveSettings();
   });
+  $('set-openai-key').addEventListener('input', e => {
+    App.settings.openaiKey = e.target.value.trim();
+    saveSettings();
+  });
   const engineSel = $('set-engine');
   engineSel.value = App.settings.sttEngine;
   $('whisper-config').style.display = App.settings.sttEngine === 'local-whisper' ? 'block' : 'none';
@@ -1313,6 +1480,11 @@ function openSettings() {
     btn.textContent = 'Loading...';
     try { await loadWhisper(); btn.textContent = 'Loaded · Ready'; }
     catch (e) { btn.textContent = 'Failed · Try again'; btn.disabled = false; }
+  });
+  $('tg-aieval').addEventListener('click', () => {
+    App.settings.aiEval = !App.settings.aiEval;
+    $('tg-aieval').classList.toggle('on', App.settings.aiEval);
+    saveSettings();
   });
   $('tg-autostart').addEventListener('click', () => {
     App.settings.autoStart = !App.settings.autoStart;
